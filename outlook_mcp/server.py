@@ -7,6 +7,7 @@ Ferramentas expostas:
   - search_emails
   - get_email_content
   - move_email
+  - move_emails_batch
   - mark_as_read
   - flag_email
 
@@ -15,6 +16,7 @@ Autenticação: MSAL (device code flow), delegada, com cache de token local.
 
 import os
 import json
+import time
 from typing import Optional
 
 import httpx
@@ -50,6 +52,23 @@ def _graph_post(path: str, body: dict) -> dict:
         resp = client.post(f"{GRAPH_BASE}{path}", headers=_headers(), json=body)
         resp.raise_for_status()
         return resp.json() if resp.content else {}
+
+
+BATCH_LIMIT = 20  # limite do Graph: 20 operações por requisição /$batch
+
+
+def _graph_batch(requests_: list[dict]) -> list[dict]:
+    """
+    Executa até 20 sub-requisições numa única chamada a POST /$batch.
+
+    O Graph responde 200 mesmo quando sub-requisições individuais falham —
+    o status real de cada uma vem dentro de 'responses'. A ordem da resposta
+    não é garantida, por isso cada sub-requisição leva um 'id' próprio.
+    """
+    with httpx.Client(timeout=60) as client:
+        resp = client.post(f"{GRAPH_BASE}/$batch", headers=_headers(), json={"requests": requests_})
+        resp.raise_for_status()
+        return resp.json().get("responses", [])
 
 
 def _summarize_message(m: dict) -> dict:
@@ -143,6 +162,83 @@ def move_email(email_id: str, target_folder: str) -> str:
     """
     result = _graph_post(f"/me/messages/{email_id}/move", {"destinationId": target_folder})
     return json.dumps({"movido": True, "novo_id": result.get("id")}, ensure_ascii=False)
+
+
+@mcp.tool()
+def move_emails_batch(email_ids: list[str], target_folder: str) -> str:
+    """
+    Move vários e-mails de uma vez, agrupando em lotes de 20 numa única
+    requisição ao Graph (POST /$batch). Para centenas de e-mails isso é
+    ~20x menos chamadas de rede do que chamar move_email um por um.
+
+    E-mails que falharem não interrompem o lote: a resposta traz a lista
+    de sucessos e a de falhas, cada uma com o motivo.
+
+    Args:
+        email_ids: lista de ids de e-mail a mover
+        target_folder: nome bem-conhecido (ex: 'archive', 'deleteditems') ou id da pasta destino
+    """
+    if not email_ids:
+        return json.dumps({"erro": "email_ids está vazio"}, ensure_ascii=False)
+
+    movidos: list[dict] = []
+    falhas: list[dict] = []
+    pendentes = list(email_ids)
+    ja_tentou_retry = False
+
+    while pendentes:
+        lote, pendentes = pendentes[:BATCH_LIMIT], pendentes[BATCH_LIMIT:]
+
+        # O id da sub-requisição é o índice no lote; guardamos o mapa para
+        # reassociar cada resposta ao e-mail certo (a ordem não é garantida).
+        por_id = {str(i): eid for i, eid in enumerate(lote)}
+        requests_ = [
+            {
+                "id": str(i),
+                "method": "POST",
+                "url": f"/me/messages/{eid}/move",
+                "headers": {"Content-Type": "application/json"},
+                "body": {"destinationId": target_folder},
+            }
+            for i, eid in enumerate(lote)
+        ]
+
+        respostas = _graph_batch(requests_)
+
+        reenfileirar: list[str] = []
+        espera = 0
+        for r in respostas:
+            eid = por_id.get(str(r.get("id")), "?")
+            status = r.get("status", 0)
+            corpo = r.get("body") or {}
+
+            if 200 <= status < 300:
+                movidos.append({"id_antigo": eid, "id_novo": corpo.get("id")})
+            elif status == 429 and not ja_tentou_retry:
+                # Throttling: o Graph diz em quantos segundos podemos voltar.
+                reenfileirar.append(eid)
+                espera = max(espera, int((r.get("headers") or {}).get("Retry-After", 5)))
+            else:
+                erro = corpo.get("error") or {}
+                falhas.append({
+                    "id": eid,
+                    "status": status,
+                    "motivo": erro.get("message") or erro.get("code") or "erro desconhecido",
+                })
+
+        if reenfileirar:
+            ja_tentou_retry = True
+            time.sleep(espera)
+            pendentes = reenfileirar + pendentes
+
+    return json.dumps({
+        "total_pedido": len(email_ids),
+        "movidos": len(movidos),
+        "falharam": len(falhas),
+        "lotes": -(-len(email_ids) // BATCH_LIMIT),
+        "detalhes_movidos": movidos,
+        "detalhes_falhas": falhas,
+    }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

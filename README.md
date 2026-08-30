@@ -13,7 +13,7 @@ MCP Outlook/
 ├── outlook_mcp/         # código do servidor
 │   ├── __init__.py
 │   ├── auth.py          # login MSAL (device code) + cache de token
-│   ├── server.py        # definição do MCP e das 7 ferramentas
+│   ├── server.py        # definição do MCP e das 8 ferramentas
 │   └── http_app.py      # app Starlette + middleware de auth Bearer
 ├── docker/
 │   └── Dockerfile
@@ -111,6 +111,7 @@ Reinicie o Claude Desktop. As ferramentas devem aparecer disponíveis na convers
 | `search_emails` | Busca por termo em toda a caixa |
 | `get_email_content` | Retorna o corpo completo de um e-mail |
 | `move_email` | Move um e-mail para outra pasta |
+| `move_emails_batch` | Move vários e-mails de uma vez (lotes de 20 via `POST /$batch`) |
 | `mark_as_read` | Marca como lido/não lido |
 | `flag_email` | Sinaliza um e-mail para acompanhamento |
 
