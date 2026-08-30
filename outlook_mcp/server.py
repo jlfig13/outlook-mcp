@@ -8,6 +8,9 @@ Ferramentas expostas:
   - get_email_content
   - move_email
   - move_emails_batch
+  - list_rules
+  - create_rule
+  - delete_rule
   - mark_as_read
   - flag_email
 
@@ -17,6 +20,7 @@ Autenticação: MSAL (device code flow), delegada, com cache de token local.
 import os
 import json
 import time
+import functools
 from typing import Optional
 
 import httpx
@@ -69,6 +73,59 @@ def _graph_batch(requests_: list[dict]) -> list[dict]:
         resp = client.post(f"{GRAPH_BASE}/$batch", headers=_headers(), json={"requests": requests_})
         resp.raise_for_status()
         return resp.json().get("responses", [])
+
+
+_ERRO_ESCOPO_REGRAS = {
+    "erro": "acesso negado às regras (403)",
+    "causa": "as regras exigem o escopo MailboxSettings.ReadWrite, que não está no token atual "
+             "(Mail.Read/ReadWrite/Send não servem para este endpoint).",
+    "como_resolver": [
+        "1. No Entra ID → seu app → Permissões de APIs → Microsoft Graph → Permissões delegadas, "
+        "adicione MailboxSettings.ReadWrite",
+        "2. Defina a variável de ambiente OUTLOOK_MCP_ENABLE_RULES=1",
+        "3. Apague token_cache.bin e rode o login de novo para consentir o novo escopo",
+    ],
+}
+
+
+def _regras_guard(fn):
+    """Traduz o 403 de escopo faltando numa mensagem acionável em vez de um traceback."""
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        try:
+            return fn(*a, **kw)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                return json.dumps(_ERRO_ESCOPO_REGRAS, ensure_ascii=False, indent=2)
+            raise
+    return wrapper
+
+
+def _resolve_folder_id(nome_ou_id: str) -> str:
+    """
+    Regras do Graph exigem o ID da pasta em moveToFolder — nomes bem-conhecidos
+    como 'archive' não são aceitos ali (ao contrário do endpoint /move).
+    Aceita id cru, nome bem-conhecido ou nome de exibição (sem diferenciar caixa).
+    """
+    pastas = _graph_get("/me/mailFolders", params={"$top": 100}).get("value", [])
+
+    for f in pastas:
+        if f["id"] == nome_ou_id:
+            return f["id"]
+
+    alvo = nome_ou_id.strip().lower()
+    for f in pastas:
+        if f["displayName"].strip().lower() == alvo:
+            return f["id"]
+
+    # Nome bem-conhecido (archive, inbox, deleteditems...): o Graph resolve no GET.
+    try:
+        return _graph_get(f"/me/mailFolders/{nome_ou_id}")["id"]
+    except httpx.HTTPStatusError:
+        pass
+
+    disponiveis = ", ".join(f["displayName"] for f in pastas)
+    raise ValueError(f"pasta '{nome_ou_id}' não encontrada. Disponíveis: {disponiveis}")
 
 
 def _summarize_message(m: dict) -> dict:
@@ -239,6 +296,119 @@ def move_emails_batch(email_ids: list[str], target_folder: str) -> str:
         "detalhes_movidos": movidos,
         "detalhes_falhas": falhas,
     }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+@_regras_guard
+def list_rules() -> str:
+    """Lista as regras de caixa de entrada já existentes (nome, sequência, condições e ações)."""
+    data = _graph_get("/me/mailFolders/inbox/messageRules")
+    regras = [{
+        "id": r.get("id"),
+        "nome": r.get("displayName"),
+        "sequencia": r.get("sequence"),
+        "ativa": r.get("isEnabled"),
+        "condicoes": r.get("conditions"),
+        "acoes": r.get("actions"),
+    } for r in data.get("value", [])]
+    return json.dumps({"total": len(regras), "regras": regras}, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+@_regras_guard
+def create_rule(
+    name: str,
+    target_folder: str,
+    sender_contains: Optional[list[str]] = None,
+    subject_contains: Optional[list[str]] = None,
+    body_contains: Optional[list[str]] = None,
+    mark_as_read: bool = False,
+    stop_processing: bool = True,
+    enabled: bool = True,
+) -> str:
+    """
+    Cria uma regra de caixa de entrada que move e-mails para uma pasta.
+
+    Só expõe ações seguras: mover, marcar como lido e parar o processamento.
+    Encaminhamento automático (forwardTo/redirectTo) e exclusão permanente
+    NÃO são expostos de propósito — regra de encaminhamento é o vetor
+    clássico de vazamento de e-mail.
+
+    É preciso informar ao menos uma condição.
+
+    Args:
+        name: nome da regra (aparece na interface do Outlook)
+        target_folder: pasta destino — id, nome bem-conhecido ('archive') ou nome de exibição ('Arquivo Morto')
+        sender_contains: casa se o remetente contiver qualquer um destes textos
+        subject_contains: casa se o assunto contiver qualquer um destes textos
+        body_contains: casa se o corpo contiver qualquer um destes textos
+        mark_as_read: também marcar como lido ao aplicar
+        stop_processing: parar de avaliar as regras seguintes quando esta casar (padrão: sim)
+        enabled: criar já ativa (padrão: sim)
+    """
+    condicoes = {}
+    if sender_contains:
+        condicoes["senderContains"] = sender_contains
+    if subject_contains:
+        condicoes["subjectContains"] = subject_contains
+    if body_contains:
+        condicoes["bodyContains"] = body_contains
+
+    if not condicoes:
+        return json.dumps(
+            {"erro": "informe ao menos uma condição (sender_contains, subject_contains ou body_contains)"},
+            ensure_ascii=False,
+        )
+
+    try:
+        folder_id = _resolve_folder_id(target_folder)
+    except ValueError as e:
+        return json.dumps({"erro": str(e)}, ensure_ascii=False)
+
+    existentes = _graph_get("/me/mailFolders/inbox/messageRules").get("value", [])
+    if any((r.get("displayName") or "").strip().lower() == name.strip().lower() for r in existentes):
+        return json.dumps(
+            {"erro": f"já existe uma regra chamada '{name}'. Use outro nome ou remova a antiga."},
+            ensure_ascii=False,
+        )
+
+    acoes = {"moveToFolder": folder_id, "stopProcessingRules": stop_processing}
+    if mark_as_read:
+        acoes["markAsRead"] = True
+
+    corpo = {
+        "displayName": name,
+        "sequence": max([r.get("sequence", 0) for r in existentes], default=0) + 1,
+        "isEnabled": enabled,
+        "conditions": condicoes,
+        "actions": acoes,
+    }
+
+    r = _graph_post("/me/mailFolders/inbox/messageRules", corpo)
+    return json.dumps({
+        "criada": True,
+        "id": r.get("id"),
+        "nome": r.get("displayName"),
+        "sequencia": r.get("sequence"),
+        "ativa": r.get("isEnabled"),
+        "condicoes": r.get("conditions"),
+        "acoes": r.get("actions"),
+        "aviso": "Regras só valem para e-mails que chegarem a partir de agora; "
+                 "o backlog já na caixa precisa ser movido com move_emails_batch.",
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+@_regras_guard
+def delete_rule(rule_id: str) -> str:
+    """
+    Remove uma regra de caixa de entrada pelo id (veja os ids em list_rules).
+    Apaga só a regra — nenhum e-mail é afetado.
+    """
+    with httpx.Client(timeout=30) as client:
+        resp = client.delete(f"{GRAPH_BASE}/me/mailFolders/inbox/messageRules/{rule_id}", headers=_headers())
+        resp.raise_for_status()
+    return json.dumps({"removida": True, "id": rule_id}, ensure_ascii=False)
 
 
 @mcp.tool()

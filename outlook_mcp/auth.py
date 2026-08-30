@@ -21,6 +21,16 @@ SCOPES = [
     "Mail.Send",  # remova se não precisar enviar e-mails
 ]
 
+# As ferramentas de regras (list_rules/create_rule/delete_rule) exigem
+# MailboxSettings.ReadWrite — um escopo separado de Mail.*, que dá acesso a
+# TODAS as configurações da caixa (incluindo respostas automáticas e fuso).
+# Fica desligado por padrão: quem não usa regras não concede esse acesso.
+# Para ligar: registre MailboxSettings.ReadWrite no app do Entra ID, defina
+# OUTLOOK_MCP_ENABLE_RULES=1 e refaça o login (o consentimento é pedido de novo).
+ENABLE_RULES = os.environ.get("OUTLOOK_MCP_ENABLE_RULES", "").strip().lower() in ("1", "true", "yes")
+if ENABLE_RULES:
+    SCOPES.append("MailboxSettings.ReadWrite")
+
 # Raiz do projeto (um nivel acima do pacote), para o cache continuar
 # no mesmo lugar dos entrypoints e do volume do Docker.
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

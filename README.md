@@ -13,7 +13,7 @@ MCP Outlook/
 ├── outlook_mcp/         # código do servidor
 │   ├── __init__.py
 │   ├── auth.py          # login MSAL (device code) + cache de token
-│   ├── server.py        # definição do MCP e das 8 ferramentas
+│   ├── server.py        # definição do MCP e das 11 ferramentas
 │   └── http_app.py      # app Starlette + middleware de auth Bearer
 ├── docker/
 │   └── Dockerfile
@@ -112,6 +112,9 @@ Reinicie o Claude Desktop. As ferramentas devem aparecer disponíveis na convers
 | `get_email_content` | Retorna o corpo completo de um e-mail |
 | `move_email` | Move um e-mail para outra pasta |
 | `move_emails_batch` | Move vários e-mails de uma vez (lotes de 20 via `POST /$batch`) |
+| `list_rules` | Lista as regras de caixa de entrada |
+| `create_rule` | Cria regra que move e-mails para uma pasta |
+| `delete_rule` | Remove uma regra pelo id |
 | `mark_as_read` | Marca como lido/não lido |
 | `flag_email` | Sinaliza um e-mail para acompanhamento |
 
@@ -121,6 +124,27 @@ Dá pra rodar o servidor 24/7 num celular Android antigo via Termux, fechado à
 sua Wi-Fi, e conectar o Claude Desktop de outra máquina. Guia completo —
 incluindo Docker, token de auth e proteção contra DNS rebinding — em
 **[docs/rede-local.md](docs/rede-local.md)**.
+
+## Regras de caixa de entrada (opcional)
+
+As ferramentas `list_rules` / `create_rule` / `delete_rule` exigem o escopo
+`MailboxSettings.ReadWrite`, separado de `Mail.*`. Esse escopo dá acesso a
+**todas** as configurações da caixa (respostas automáticas, fuso horário etc.),
+por isso vem desligado por padrão. Para habilitar:
+
+1. No Entra ID → seu app → **Permissões de APIs** → Microsoft Graph →
+   **Permissões delegadas** → adicione `MailboxSettings.ReadWrite`
+2. Defina `OUTLOOK_MCP_ENABLE_RULES=1` (no ambiente ou no `env` do
+   `claude_desktop_config.json`)
+3. Apague `token_cache.bin` e refaça o login para consentir o novo escopo
+
+Sem isso, as três ferramentas devolvem um erro explicando o que falta — o
+restante do servidor funciona normalmente.
+
+Por decisão de projeto, `create_rule` **não** expõe as ações `forwardTo`,
+`redirectTo` nem `permanentDelete` do Graph: regra de encaminhamento automático
+é o vetor clássico de vazamento de e-mail, e exclusão permanente destrói
+mensagem sem passar pela lixeira.
 
 ## Segurança
 
