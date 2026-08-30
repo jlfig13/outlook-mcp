@@ -13,7 +13,7 @@ MCP Outlook/
 ├── outlook_mcp/         # código do servidor
 │   ├── __init__.py
 │   ├── auth.py          # login MSAL (device code) + cache de token
-│   ├── server.py        # definição do MCP e das 11 ferramentas
+│   ├── server.py        # definição do MCP e das 14 ferramentas
 │   └── http_app.py      # app Starlette + middleware de auth Bearer
 ├── docker/
 │   └── Dockerfile
@@ -107,11 +107,14 @@ Reinicie o Claude Desktop. As ferramentas devem aparecer disponíveis na convers
 | Ferramenta | O que faz |
 |---|---|
 | `list_folders` | Lista as pastas de e-mail |
-| `list_recent_emails` | Lista os e-mails mais recentes de uma pasta |
+| `list_recent_emails` | Lista e-mails de uma pasta (com `skip`, `unread_only` e escolha de campos) |
+| `sender_stats` | Mapa da caixa agrupado por remetente, com contagens |
 | `search_emails` | Busca por termo em toda a caixa |
 | `get_email_content` | Retorna o corpo completo de um e-mail |
 | `move_email` | Move um e-mail para outra pasta |
 | `move_emails_batch` | Move vários e-mails de uma vez (lotes de 20 via `POST /$batch`) |
+| `move_by_sender` | Move tudo de um remetente, com `dry_run` por padrão |
+| `mark_as_read_batch` | Marca vários como lido/não lido em lote |
 | `list_rules` | Lista as regras de caixa de entrada |
 | `create_rule` | Cria regra que move e-mails para uma pasta |
 | `delete_rule` | Remove uma regra pelo id |
@@ -124,6 +127,22 @@ Dá pra rodar o servidor 24/7 num celular Android antigo via Termux, fechado à
 sua Wi-Fi, e conectar o Claude Desktop de outra máquina. Guia completo —
 incluindo Docker, token de auth e proteção contra DNS rebinding — em
 **[docs/rede-local.md](docs/rede-local.md)**.
+
+## Trabalhando com volume alto
+
+Para caixas com centenas de e-mails, a ordem que gasta menos contexto:
+
+1. **`sender_stats`** primeiro — devolve o mapa da caixa (quem manda, quanto,
+   quantos não lidos) em poucos KB. Uma listagem equivalente custaria ~7x mais.
+2. **`move_by_sender`** com `dry_run=True` (o padrão) — confira a contagem
+   antes de executar. Os IDs são filtrados no servidor e nunca trafegam.
+3. Só então `list_recent_emails` com `fields=["id","de","assunto"]` e `skip`
+   para o que sobrou. Cortar o `bodyPreview` reduz a resposta em ~75%.
+
+`move_emails_batch` e `mark_as_read_batch` agrupam em lotes de 20 numa única
+requisição. Atenção: **o move troca o ID do e-mail** — use os `id_novo` que
+voltam em `detalhes_movidos` para qualquer passo seguinte. O `PATCH` do
+`mark_as_read_batch` preserva os ids.
 
 ## Regras de caixa de entrada (opcional)
 

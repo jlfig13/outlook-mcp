@@ -4,10 +4,13 @@ Servidor MCP local para organizar e-mails do Outlook via Microsoft Graph API.
 Ferramentas expostas:
   - list_folders
   - list_recent_emails
+  - sender_stats
   - search_emails
   - get_email_content
   - move_email
   - move_emails_batch
+  - move_by_sender
+  - mark_as_read_batch
   - list_rules
   - create_rule
   - delete_rule
@@ -128,8 +131,28 @@ def _resolve_folder_id(nome_ou_id: str) -> str:
     raise ValueError(f"pasta '{nome_ou_id}' não encontrada. Disponíveis: {disponiveis}")
 
 
-def _summarize_message(m: dict) -> dict:
-    return {
+# Campo devolvido -> campo do Graph. Pedir menos campos encolhe tanto a
+# resposta do Graph quanto o texto que o modelo precisa ler: um bodyPreview
+# são ~250 caracteres por e-mail, um id do Graph são ~150.
+CAMPOS = {
+    "id": "id",
+    "assunto": "subject",
+    "de": "from",
+    "recebido_em": "receivedDateTime",
+    "lido": "isRead",
+    "preview": "bodyPreview",
+    "pasta_id": "parentFolderId",
+}
+CAMPOS_PADRAO = list(CAMPOS)
+
+
+def _select_para(campos: list[str]) -> str:
+    return ",".join(CAMPOS[c] for c in campos)
+
+
+def _summarize_message(m: dict, campos: Optional[list[str]] = None) -> dict:
+    campos = campos or CAMPOS_PADRAO
+    fonte = {
         "id": m.get("id"),
         "assunto": m.get("subject"),
         "de": (m.get("from") or {}).get("emailAddress", {}).get("address"),
@@ -138,6 +161,49 @@ def _summarize_message(m: dict) -> dict:
         "preview": m.get("bodyPreview"),
         "pasta_id": m.get("parentFolderId"),
     }
+    return {c: fonte[c] for c in campos}
+
+
+def _validar_campos(fields: Optional[list[str]]) -> list[str]:
+    if not fields:
+        return CAMPOS_PADRAO
+    invalidos = [f for f in fields if f not in CAMPOS]
+    if invalidos:
+        raise ValueError(f"campos inválidos: {invalidos}. Válidos: {list(CAMPOS)}")
+    return fields
+
+
+def _iter_messages(folder: str = "inbox", unread_only: bool = False,
+                   campos: Optional[list[str]] = None, max_items: int = 200,
+                   page_size: int = 100):
+    """
+    Percorre mensagens seguindo o @odata.nextLink do Graph, que pagina em
+    blocos (o $top é o tamanho da página, não um total). Para além de ~1000
+    mensagens é a única forma de alcançar o backlog antigo.
+    """
+    campos = campos or CAMPOS_PADRAO
+    params = {
+        "$top": min(page_size, max_items),
+        "$orderby": "receivedDateTime desc",
+        "$select": _select_para(campos),
+    }
+    if unread_only:
+        params["$filter"] = "isRead eq false"
+
+    url = f"{GRAPH_BASE}/me/mailFolders/{folder}/messages"
+    lidos = 0
+    with httpx.Client(timeout=60) as client:
+        while url and lidos < max_items:
+            resp = client.get(url, headers=_headers(), params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            for m in data.get("value", []):
+                yield m
+                lidos += 1
+                if lidos >= max_items:
+                    return
+            url = data.get("@odata.nextLink")
+            params = None  # o nextLink já carrega todos os parâmetros
 
 
 @mcp.tool()
@@ -150,24 +216,49 @@ def list_folders() -> str:
 
 
 @mcp.tool()
-def list_recent_emails(folder: str = "inbox", top: int = 20) -> str:
+def list_recent_emails(
+    folder: str = "inbox",
+    top: int = 20,
+    skip: int = 0,
+    unread_only: bool = False,
+    fields: Optional[list[str]] = None,
+) -> str:
     """
     Lista os e-mails mais recentes de uma pasta.
 
     Args:
         folder: nome ou id da pasta (padrão: inbox)
         top: quantidade máxima de e-mails a retornar (padrão: 20)
+        skip: quantos e-mails pular antes de começar — use para paginar o backlog
+              (ex: skip=100 pega do 101º em diante)
+        unread_only: retornar apenas não lidos
+        fields: subconjunto de campos a devolver, para economizar contexto.
+                Válidos: id, assunto, de, recebido_em, lido, preview, pasta_id.
+                Ex: ["id","de","assunto"] corta o preview de ~250 caracteres por e-mail.
     """
-    data = _graph_get(
-        f"/me/mailFolders/{folder}/messages",
-        params={
-            "$top": top,
-            "$orderby": "receivedDateTime desc",
-            "$select": "id,subject,from,receivedDateTime,isRead,bodyPreview,parentFolderId",
-        },
-    )
-    emails = [_summarize_message(m) for m in data.get("value", [])]
-    return json.dumps(emails, ensure_ascii=False, indent=2)
+    try:
+        campos = _validar_campos(fields)
+    except ValueError as e:
+        return json.dumps({"erro": str(e)}, ensure_ascii=False)
+
+    params = {
+        "$top": top,
+        "$orderby": "receivedDateTime desc",
+        "$select": _select_para(campos),
+    }
+    if skip:
+        params["$skip"] = skip
+    if unread_only:
+        params["$filter"] = "isRead eq false"
+
+    data = _graph_get(f"/me/mailFolders/{folder}/messages", params=params)
+    emails = [_summarize_message(m, campos) for m in data.get("value", [])]
+    return json.dumps({
+        "total_retornado": len(emails),
+        "skip_usado": skip,
+        "proximo_skip": skip + len(emails) if len(emails) == top else None,
+        "emails": emails,
+    }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -294,6 +385,185 @@ def move_emails_batch(email_ids: list[str], target_folder: str) -> str:
         "falharam": len(falhas),
         "lotes": -(-len(email_ids) // BATCH_LIMIT),
         "detalhes_movidos": movidos,
+        "detalhes_falhas": falhas,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def sender_stats(folder: str = "inbox", max_scan: int = 500, unread_only: bool = False,
+                 top_remetentes: int = 50) -> str:
+    """
+    Devolve o mapa da caixa agrupado por remetente, em vez da lista de e-mails.
+
+    Feito para ser a PRIMEIRA chamada ao organizar: para classificar e desenhar
+    regras o que importa é quem manda e quanto, não o conteúdo de cada mensagem.
+    Varre as mensagens pedindo só remetente/assunto/isRead e agrega aqui no
+    servidor — a resposta sai em poucos KB, contra centenas de KB de uma
+    listagem equivalente.
+
+    Args:
+        folder: pasta a varrer (padrão: inbox)
+        max_scan: teto de mensagens a percorrer (padrão: 500)
+        unread_only: contar apenas não lidos
+        top_remetentes: quantos remetentes devolver, do maior volume para o menor
+    """
+    campos = ["de", "assunto", "lido"]
+    agg: dict[str, dict] = {}
+    total = 0
+
+    for m in _iter_messages(folder=folder, unread_only=unread_only,
+                            campos=campos, max_items=max_scan):
+        total += 1
+        end = (m.get("from") or {}).get("emailAddress", {}).get("address") or "(sem remetente)"
+        end = end.lower()
+        e = agg.setdefault(end, {
+            "remetente": end,
+            "dominio": end.split("@")[-1] if "@" in end else "",
+            "total": 0,
+            "nao_lidos": 0,
+            "assunto_exemplo": m.get("subject"),
+        })
+        e["total"] += 1
+        if not m.get("isRead"):
+            e["nao_lidos"] += 1
+
+    ranking = sorted(agg.values(), key=lambda x: x["total"], reverse=True)
+
+    dominios: dict[str, int] = {}
+    for e in agg.values():
+        if e["dominio"]:
+            dominios[e["dominio"]] = dominios.get(e["dominio"], 0) + e["total"]
+    top_dom = sorted(dominios.items(), key=lambda kv: kv[1], reverse=True)[:15]
+
+    return json.dumps({
+        "mensagens_varridas": total,
+        "atingiu_limite": total >= max_scan,
+        "remetentes_distintos": len(agg),
+        "top_dominios": [{"dominio": d, "total": n} for d, n in top_dom],
+        "remetentes": ranking[:top_remetentes],
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def move_by_sender(sender_contains: str, target_folder: str, folder: str = "inbox",
+                   dry_run: bool = True, max_scan: int = 500, unread_only: bool = False) -> str:
+    """
+    Move todos os e-mails de um remetente sem precisar transportar os IDs.
+
+    O filtro acontece aqui no servidor: os ids nunca precisam trafegar até quem
+    chamou (100 ids do Graph são ~15 KB só de identificadores).
+
+    Por padrão roda em dry_run: apenas conta e mostra uma amostra do que SERIA
+    movido. Para executar de fato é preciso passar dry_run=False explicitamente
+    — assim ninguém move "tudo do remetente X, seja quanto for" por engano.
+
+    Args:
+        sender_contains: trecho do endereço do remetente (ex: '99freelas', '@newsletter.com')
+        target_folder: pasta destino (nome bem-conhecido, nome de exibição ou id)
+        folder: pasta de origem (padrão: inbox)
+        dry_run: se True (padrão), só simula e devolve a contagem
+        max_scan: teto de mensagens a percorrer na origem
+        unread_only: considerar apenas não lidos
+    """
+    alvo = sender_contains.strip().lower()
+    if not alvo:
+        return json.dumps({"erro": "sender_contains está vazio"}, ensure_ascii=False)
+
+    campos = ["id", "de", "assunto"]
+    casaram, amostra = [], []
+    varridas = 0
+    for m in _iter_messages(folder=folder, unread_only=unread_only,
+                            campos=campos, max_items=max_scan):
+        varridas += 1
+        end = ((m.get("from") or {}).get("emailAddress", {}).get("address") or "").lower()
+        if alvo in end:
+            casaram.append(m["id"])
+            if len(amostra) < 5:
+                amostra.append({"de": end, "assunto": m.get("subject")})
+
+    base = {
+        "sender_contains": sender_contains,
+        "pasta_origem": folder,
+        "pasta_destino": target_folder,
+        "mensagens_varridas": varridas,
+        "atingiu_limite_varredura": varridas >= max_scan,
+        "encontrados": len(casaram),
+        "amostra": amostra,
+    }
+
+    if dry_run:
+        base["dry_run"] = True
+        base["proximo_passo"] = ("Nada foi movido. Para executar, chame de novo com dry_run=False "
+                                 "— confirme antes o número em 'encontrados'.")
+        return json.dumps(base, ensure_ascii=False, indent=2)
+
+    if not casaram:
+        base["dry_run"] = False
+        base["movidos"] = 0
+        return json.dumps(base, ensure_ascii=False, indent=2)
+
+    resultado = json.loads(move_emails_batch(casaram, target_folder))
+    base["dry_run"] = False
+    base["movidos"] = resultado["movidos"]
+    base["falharam"] = resultado["falharam"]
+    base["detalhes_falhas"] = resultado["detalhes_falhas"]
+    return json.dumps(base, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def mark_as_read_batch(email_ids: list[str], read: bool = True) -> str:
+    """
+    Marca vários e-mails como lidos (ou não lidos) em lotes de 20 via POST /$batch.
+
+    Ao contrário do move, o PATCH não troca o id do e-mail — os mesmos ids
+    continuam válidos depois.
+
+    Args:
+        email_ids: lista de ids
+        read: True para marcar como lido, False para não lido
+    """
+    if not email_ids:
+        return json.dumps({"erro": "email_ids está vazio"}, ensure_ascii=False)
+
+    ok, falhas = 0, []
+    pendentes = list(email_ids)
+    ja_tentou_retry = False
+
+    while pendentes:
+        lote, pendentes = pendentes[:BATCH_LIMIT], pendentes[BATCH_LIMIT:]
+        por_id = {str(i): eid for i, eid in enumerate(lote)}
+        reqs = [{
+            "id": str(i),
+            "method": "PATCH",
+            "url": f"/me/messages/{eid}",
+            "headers": {"Content-Type": "application/json"},
+            "body": {"isRead": read},
+        } for i, eid in enumerate(lote)]
+
+        reenfileirar, espera = [], 0
+        for r in _graph_batch(reqs):
+            eid = por_id.get(str(r.get("id")), "?")
+            status = r.get("status", 0)
+            if 200 <= status < 300:
+                ok += 1
+            elif status == 429 and not ja_tentou_retry:
+                reenfileirar.append(eid)
+                espera = max(espera, int((r.get("headers") or {}).get("Retry-After", 5)))
+            else:
+                err = (r.get("body") or {}).get("error") or {}
+                falhas.append({"id": eid, "status": status,
+                               "motivo": err.get("message") or err.get("code") or "erro desconhecido"})
+
+        if reenfileirar:
+            ja_tentou_retry = True
+            time.sleep(espera)
+            pendentes = reenfileirar + pendentes
+
+    return json.dumps({
+        "total_pedido": len(email_ids),
+        "atualizados": ok,
+        "falharam": len(falhas),
+        "isRead": read,
         "detalhes_falhas": falhas,
     }, ensure_ascii=False, indent=2)
 
