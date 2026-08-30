@@ -133,11 +133,20 @@ incluindo Docker, token de auth e proteção contra DNS rebinding — em
 Para caixas com centenas de e-mails, a ordem que gasta menos contexto:
 
 1. **`sender_stats`** primeiro — devolve o mapa da caixa (quem manda, quanto,
-   quantos não lidos) em poucos KB. Uma listagem equivalente custaria ~7x mais.
+   quantos não lidos, até 3 assuntos de exemplo) em poucos KB. Uma listagem
+   equivalente custaria ~7x mais. Um remetente pode misturar tipos de e-mail
+   (fatura e cupom do mesmo endereço) — os 3 exemplos ajudam a notar isso.
 2. **`move_by_sender`** com `dry_run=True` (o padrão) — confira a contagem
-   antes de executar. Os IDs são filtrados no servidor e nunca trafegam.
+   antes de executar. Os IDs são filtrados no servidor e nunca trafegam. Use
+   `subject_contains`/`subject_not_contains` para separar remetentes mistos.
 3. Só então `list_recent_emails` com `fields=["id","de","assunto"]` e `skip`
    para o que sobrou. Cortar o `bodyPreview` reduz a resposta em ~75%.
+
+Caixas grandes: `sender_stats` e `move_by_sender` varrem no máximo `max_scan`
+mensagens por chamada (padrão 400). Ao bater o teto, a resposta traz
+`atingiu_limite`/`atingiu_limite_varredura` e `proximo_skip` — repita a
+chamada com `skip=proximo_skip` para continuar de onde parou, em vez de subir
+`max_scan` numa única chamada.
 
 `move_emails_batch` e `mark_as_read_batch` agrupam em lotes de 20 numa única
 requisição. Atenção: **o move troca o ID do e-mail** — use os `id_novo` que

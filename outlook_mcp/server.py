@@ -175,11 +175,15 @@ def _validar_campos(fields: Optional[list[str]]) -> list[str]:
 
 def _iter_messages(folder: str = "inbox", unread_only: bool = False,
                    campos: Optional[list[str]] = None, max_items: int = 200,
-                   page_size: int = 100):
+                   page_size: int = 100, skip: int = 0):
     """
     Percorre mensagens seguindo o @odata.nextLink do Graph, que pagina em
     blocos (o $top é o tamanho da página, não um total). Para além de ~1000
     mensagens é a única forma de alcançar o backlog antigo.
+
+    skip só se aplica à primeira página — a partir daí o nextLink já carrega
+    a posição. Serve para retomar uma varredura em fatias (0-400, 400-800...)
+    quando um único max_scan grande estourasse o tempo de uma chamada.
     """
     campos = campos or CAMPOS_PADRAO
     params = {
@@ -187,6 +191,8 @@ def _iter_messages(folder: str = "inbox", unread_only: bool = False,
         "$orderby": "receivedDateTime desc",
         "$select": _select_para(campos),
     }
+    if skip:
+        params["$skip"] = skip
     if unread_only:
         params["$filter"] = "isRead eq false"
 
@@ -390,8 +396,8 @@ def move_emails_batch(email_ids: list[str], target_folder: str) -> str:
 
 
 @mcp.tool()
-def sender_stats(folder: str = "inbox", max_scan: int = 500, unread_only: bool = False,
-                 top_remetentes: int = 50) -> str:
+def sender_stats(folder: str = "inbox", max_scan: int = 400, skip: int = 0,
+                 unread_only: bool = False, top_remetentes: int = 50) -> str:
     """
     Devolve o mapa da caixa agrupado por remetente, em vez da lista de e-mails.
 
@@ -401,9 +407,14 @@ def sender_stats(folder: str = "inbox", max_scan: int = 500, unread_only: bool =
     servidor — a resposta sai em poucos KB, contra centenas de KB de uma
     listagem equivalente.
 
+    Para caixas grandes, prefira várias chamadas com max_scan~400 e skip
+    crescente (0, 400, 800...) a uma única chamada com max_scan alto — o
+    total de itens percorridos entra na duração da chamada.
+
     Args:
         folder: pasta a varrer (padrão: inbox)
-        max_scan: teto de mensagens a percorrer (padrão: 500)
+        max_scan: teto de mensagens a percorrer nesta chamada (padrão: 400)
+        skip: quantas mensagens já varridas em chamadas anteriores pular
         unread_only: contar apenas não lidos
         top_remetentes: quantos remetentes devolver, do maior volume para o menor
     """
@@ -411,8 +422,8 @@ def sender_stats(folder: str = "inbox", max_scan: int = 500, unread_only: bool =
     agg: dict[str, dict] = {}
     total = 0
 
-    for m in _iter_messages(folder=folder, unread_only=unread_only,
-                            campos=campos, max_items=max_scan):
+    for m in _iter_messages(folder=folder, unread_only=unread_only, campos=campos,
+                            max_items=max_scan, skip=skip):
         total += 1
         end = (m.get("from") or {}).get("emailAddress", {}).get("address") or "(sem remetente)"
         end = end.lower()
@@ -421,11 +432,16 @@ def sender_stats(folder: str = "inbox", max_scan: int = 500, unread_only: bool =
             "dominio": end.split("@")[-1] if "@" in end else "",
             "total": 0,
             "nao_lidos": 0,
-            "assunto_exemplo": m.get("subject"),
+            "assuntos_exemplo": [],
         })
         e["total"] += 1
         if not m.get("isRead"):
             e["nao_lidos"] += 1
+        assunto = m.get("subject")
+        # Até 3 exemplos distintos: um só esconde remetentes mistos (ex: o
+        # mesmo endereço mandando fatura e cupom promocional).
+        if assunto and len(e["assuntos_exemplo"]) < 3 and assunto not in e["assuntos_exemplo"]:
+            e["assuntos_exemplo"].append(assunto)
 
     ranking = sorted(agg.values(), key=lambda x: x["total"], reverse=True)
 
@@ -435,9 +451,12 @@ def sender_stats(folder: str = "inbox", max_scan: int = 500, unread_only: bool =
             dominios[e["dominio"]] = dominios.get(e["dominio"], 0) + e["total"]
     top_dom = sorted(dominios.items(), key=lambda kv: kv[1], reverse=True)[:15]
 
+    atingiu_limite = total >= max_scan
     return json.dumps({
         "mensagens_varridas": total,
-        "atingiu_limite": total >= max_scan,
+        "skip_usado": skip,
+        "atingiu_limite": atingiu_limite,
+        "proximo_skip": skip + total if atingiu_limite else None,
         "remetentes_distintos": len(agg),
         "top_dominios": [{"dominio": d, "total": n} for d, n in top_dom],
         "remetentes": ranking[:top_remetentes],
@@ -445,8 +464,17 @@ def sender_stats(folder: str = "inbox", max_scan: int = 500, unread_only: bool =
 
 
 @mcp.tool()
-def move_by_sender(sender_contains: str, target_folder: str, folder: str = "inbox",
-                   dry_run: bool = True, max_scan: int = 500, unread_only: bool = False) -> str:
+def move_by_sender(
+    sender_contains: str,
+    target_folder: str,
+    folder: str = "inbox",
+    dry_run: bool = True,
+    max_scan: int = 400,
+    skip: int = 0,
+    unread_only: bool = False,
+    subject_contains: Optional[list[str]] = None,
+    subject_not_contains: Optional[list[str]] = None,
+) -> str:
     """
     Move todos os e-mails de um remetente sem precisar transportar os IDs.
 
@@ -457,39 +485,66 @@ def move_by_sender(sender_contains: str, target_folder: str, folder: str = "inbo
     movido. Para executar de fato é preciso passar dry_run=False explicitamente
     — assim ninguém move "tudo do remetente X, seja quanto for" por engano.
 
+    Para caixas grandes, prefira várias chamadas com max_scan~400 e skip
+    crescente a uma única chamada com max_scan alto (veja atingiu_limite_varredura
+    e proximo_skip na resposta). Um remetente pode misturar tipos de e-mail (ex:
+    fatura e cupom promocional do mesmo endereço) — nesse caso use
+    subject_contains/subject_not_contains para separar em vez de mover tudo.
+
     Args:
         sender_contains: trecho do endereço do remetente (ex: '99freelas', '@newsletter.com')
         target_folder: pasta destino (nome bem-conhecido, nome de exibição ou id)
         folder: pasta de origem (padrão: inbox)
         dry_run: se True (padrão), só simula e devolve a contagem
-        max_scan: teto de mensagens a percorrer na origem
+        max_scan: teto de mensagens a percorrer nesta chamada (padrão: 400)
+        skip: quantas mensagens já varridas em chamadas anteriores pular
         unread_only: considerar apenas não lidos
+        subject_contains: só move se o assunto contiver algum destes textos
+        subject_not_contains: não move se o assunto contiver algum destes textos
+                              (avaliado depois de subject_contains)
     """
     alvo = sender_contains.strip().lower()
     if not alvo:
         return json.dumps({"erro": "sender_contains está vazio"}, ensure_ascii=False)
 
+    inclui = [s.lower() for s in (subject_contains or [])]
+    exclui = [s.lower() for s in (subject_not_contains or [])]
+
     campos = ["id", "de", "assunto"]
     casaram, amostra = [], []
     varridas = 0
-    for m in _iter_messages(folder=folder, unread_only=unread_only,
-                            campos=campos, max_items=max_scan):
+    for m in _iter_messages(folder=folder, unread_only=unread_only, campos=campos,
+                            max_items=max_scan, skip=skip):
         varridas += 1
         end = ((m.get("from") or {}).get("emailAddress", {}).get("address") or "").lower()
-        if alvo in end:
-            casaram.append(m["id"])
-            if len(amostra) < 5:
-                amostra.append({"de": end, "assunto": m.get("subject")})
+        if alvo not in end:
+            continue
+        assunto_lower = (m.get("subject") or "").lower()
+        if inclui and not any(s in assunto_lower for s in inclui):
+            continue
+        if exclui and any(s in assunto_lower for s in exclui):
+            continue
+        casaram.append(m["id"])
+        if len(amostra) < 5:
+            amostra.append({"de": end, "assunto": m.get("subject")})
 
+    atingiu_limite = varridas >= max_scan
     base = {
         "sender_contains": sender_contains,
+        "subject_contains": subject_contains,
+        "subject_not_contains": subject_not_contains,
         "pasta_origem": folder,
         "pasta_destino": target_folder,
         "mensagens_varridas": varridas,
-        "atingiu_limite_varredura": varridas >= max_scan,
+        "skip_usado": skip,
+        "atingiu_limite_varredura": atingiu_limite,
+        "proximo_skip": skip + varridas if atingiu_limite else None,
         "encontrados": len(casaram),
         "amostra": amostra,
     }
+    if atingiu_limite:
+        base["aviso"] = ("A varredura bateu o teto desta chamada — pode haver mais mensagens "
+                         "além de mensagens_varridas. Repita com skip=proximo_skip para continuar.")
 
     if dry_run:
         base["dry_run"] = True

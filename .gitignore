@@ -17,3 +17,6 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Documento local de estado — contém dados pessoais, não versionar
+CURRENT.md
