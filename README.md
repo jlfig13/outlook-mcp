@@ -13,7 +13,7 @@ MCP Outlook/
 ├── outlook_mcp/         # código do servidor
 │   ├── __init__.py
 │   ├── auth.py          # login MSAL (device code) + cache de token
-│   ├── server.py        # definição do MCP e das 15 ferramentas
+│   ├── server.py        # definição do MCP e das 16 ferramentas
 │   └── http_app.py      # app Starlette + middleware de auth Bearer
 ├── docker/
 │   └── Dockerfile
@@ -111,9 +111,10 @@ Reinicie o Claude Desktop. As ferramentas devem aparecer disponíveis na convers
 | `sender_stats` | Mapa da caixa agrupado por remetente, com contagens |
 | `search_emails` | Busca por termo em toda a caixa |
 | `get_email_content` | Retorna o corpo completo de um e-mail |
-| `move_email` | Move um e-mail para outra pasta |
+| `move_email` | Move um e-mail para outra pasta (aceita nome de exibição, bem-conhecido ou id) |
 | `move_emails_batch` | Move vários e-mails de uma vez (lotes de 20 via `POST /$batch`) |
 | `preview_plan` | Avalia várias regras de remetente/assunto numa só varredura |
+| `apply_plan` | Aplica as regras avaliadas em `preview_plan`, numa só varredura |
 | `move_by_sender` | Move tudo de um remetente, com `dry_run` por padrão |
 | `mark_as_read_batch` | Marca vários como lido/não lido em lote |
 | `list_rules` | Lista as regras de caixa de entrada |
@@ -144,8 +145,17 @@ Para caixas com centenas de e-mails, a ordem que gasta menos contexto:
 3. **`move_by_sender`** com `dry_run=True` (o padrão) — confira a contagem
    antes de executar. Os IDs são filtrados no servidor e nunca trafegam. Use
    `subject_contains`/`subject_not_contains` para separar remetentes mistos.
-4. Só então `list_recent_emails` com `fields=["id","de","assunto"]` e `skip`
+4. Para executar um plano de várias regras de uma vez, `apply_plan` — mesma
+   lista de `rules` do `preview_plan`, uma varredura, `dry_run=True` por
+   padrão. Evita reexecutar `move_by_sender` regra por regra revarrendo a
+   mesma janela, e evita que a caixa mude entre a primeira e a última regra.
+5. Só então `list_recent_emails` com `fields=["id","de","assunto"]` e `skip`
    para o que sobrou. Cortar o `bodyPreview` reduz a resposta em ~75%.
+
+**`target_folder` sempre aceita nome de exibição** (ex: `'Financeiro/Recibos'`),
+nome bem-conhecido (`'archive'`, `'inbox'`, `'deleteditems'`) ou id de pasta —
+em `move_email`, `move_emails_batch`, `move_by_sender` e `apply_plan`. Todos
+resolvem o nome para o id real antes de chamar o Graph.
 
 Caixas grandes: `sender_stats` e `move_by_sender` varrem no máximo `max_scan`
 mensagens por chamada (padrão 400). Ao bater o teto, a resposta traz

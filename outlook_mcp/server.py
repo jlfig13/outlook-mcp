@@ -11,6 +11,7 @@ Ferramentas expostas:
   - move_emails_batch
   - move_by_sender
   - preview_plan
+  - apply_plan
   - mark_as_read_batch
   - list_rules
   - create_rule
@@ -313,29 +314,23 @@ def move_email(email_id: str, target_folder: str) -> str:
 
     Args:
         email_id: id do e-mail
-        target_folder: nome bem-conhecido (ex: 'archive', 'deleteditems') ou id da pasta destino
+        target_folder: nome bem-conhecido (ex: 'archive', 'deleteditems'), nome de exibição
+                       (ex: 'Financeiro/Recibos') ou id da pasta destino
     """
-    result = _graph_post(f"/me/messages/{email_id}/move", {"destinationId": target_folder})
+    try:
+        folder_id = _resolve_folder_id(target_folder)
+    except ValueError as e:
+        return json.dumps({"erro": str(e)}, ensure_ascii=False)
+    result = _graph_post(f"/me/messages/{email_id}/move", {"destinationId": folder_id})
     return json.dumps({"movido": True, "novo_id": result.get("id")}, ensure_ascii=False)
 
 
-@mcp.tool()
-def move_emails_batch(email_ids: list[str], target_folder: str) -> str:
+def _move_ids_batch(email_ids: list[str], folder_id: str) -> dict:
     """
-    Move vários e-mails de uma vez, agrupando em lotes de 20 numa única
-    requisição ao Graph (POST /$batch). Para centenas de e-mails isso é
-    ~20x menos chamadas de rede do que chamar move_email um por um.
-
-    E-mails que falharem não interrompem o lote: a resposta traz a lista
-    de sucessos e a de falhas, cada uma com o motivo.
-
-    Args:
-        email_ids: lista de ids de e-mail a mover
-        target_folder: nome bem-conhecido (ex: 'archive', 'deleteditems') ou id da pasta destino
+    Núcleo do move em lote: espera um ID de pasta JÁ RESOLVIDO (não um nome).
+    Fatorado de move_emails_batch para que apply_plan resolva a pasta uma vez
+    por regra em vez de uma vez por chamada de lote.
     """
-    if not email_ids:
-        return json.dumps({"erro": "email_ids está vazio"}, ensure_ascii=False)
-
     movidos: list[dict] = []
     falhas: list[dict] = []
     pendentes = list(email_ids)
@@ -353,7 +348,7 @@ def move_emails_batch(email_ids: list[str], target_folder: str) -> str:
                 "method": "POST",
                 "url": f"/me/messages/{eid}/move",
                 "headers": {"Content-Type": "application/json"},
-                "body": {"destinationId": target_folder},
+                "body": {"destinationId": folder_id},
             }
             for i, eid in enumerate(lote)
         ]
@@ -386,13 +381,40 @@ def move_emails_batch(email_ids: list[str], target_folder: str) -> str:
             time.sleep(espera)
             pendentes = reenfileirar + pendentes
 
+    return {"movidos": movidos, "falhas": falhas}
+
+
+@mcp.tool()
+def move_emails_batch(email_ids: list[str], target_folder: str) -> str:
+    """
+    Move vários e-mails de uma vez, agrupando em lotes de 20 numa única
+    requisição ao Graph (POST /$batch). Para centenas de e-mails isso é
+    ~20x menos chamadas de rede do que chamar move_email um por um.
+
+    E-mails que falharem não interrompem o lote: a resposta traz a lista
+    de sucessos e a de falhas, cada uma com o motivo.
+
+    Args:
+        email_ids: lista de ids de e-mail a mover
+        target_folder: nome bem-conhecido (ex: 'archive', 'deleteditems'), nome de exibição
+                       (ex: 'Financeiro/Recibos') ou id da pasta destino
+    """
+    if not email_ids:
+        return json.dumps({"erro": "email_ids está vazio"}, ensure_ascii=False)
+
+    try:
+        folder_id = _resolve_folder_id(target_folder)
+    except ValueError as e:
+        return json.dumps({"erro": str(e)}, ensure_ascii=False)
+
+    r = _move_ids_batch(email_ids, folder_id)
     return json.dumps({
         "total_pedido": len(email_ids),
-        "movidos": len(movidos),
-        "falharam": len(falhas),
+        "movidos": len(r["movidos"]),
+        "falharam": len(r["falhas"]),
         "lotes": -(-len(email_ids) // BATCH_LIMIT),
-        "detalhes_movidos": movidos,
-        "detalhes_falhas": falhas,
+        "detalhes_movidos": r["movidos"],
+        "detalhes_falhas": r["falhas"],
     }, ensure_ascii=False, indent=2)
 
 
@@ -576,6 +598,115 @@ def preview_plan(rules: list[dict], folder: str = "inbox", max_scan: int = 400,
 
 
 @mcp.tool()
+def apply_plan(rules: list[dict], folder: str = "inbox", max_scan: int = 400,
+               skip: int = 0, unread_only: bool = False, dry_run: bool = True,
+               amostra_por_regra: int = 3, max_nao_classificados: int = 30) -> str:
+    """
+    Mesma forma de 'rules' do preview_plan, mas aplica de verdade: varre uma
+    vez, classifica cada mensagem na primeira regra que casar e move — em vez
+    de rodar move_by_sender uma vez por regra revarrendo a mesma janela.
+
+    Existe para fechar uma janela de inconsistência: entre um preview_plan e a
+    última de N chamadas de move_by_sender que o executam regra por regra, a
+    caixa muda — chegam e-mails novos, e cada move troca o id da mensagem
+    movida. Quanto mais chamadas separadas, maior a chance de que o que
+    finalmente é movido já não seja exatamente o que foi aprovado no preview.
+    Aqui a classificação é decidida uma vez, sobre o estado varrido nesta
+    própria chamada, e aplicada de uma vez.
+
+    Todas as pastas destino são resolvidas e validadas ANTES de varrer — um
+    nome de pasta inválido aparece de imediato, sem gastar a varredura nem
+    tentar mover nada.
+
+    Sempre dry_run por padrão, igual ao preview_plan: só classifica e conta.
+    dry_run=False de fato move, regra por regra, usando POST /$batch.
+
+    Args:
+        rules: lista de {sender_contains, target_folder, subject_contains?, subject_not_contains?}
+        folder: pasta a varrer (padrão: inbox)
+        max_scan: teto de mensagens a percorrer nesta chamada (padrão: 400)
+        skip: quantas mensagens já varridas em chamadas anteriores pular
+        unread_only: considerar apenas não lidos
+        dry_run: se True (padrão), só classifica e conta — nada é movido
+        amostra_por_regra: quantos exemplos mostrar por regra que casou
+        max_nao_classificados: quantos exemplos mostrar do que sobrou sem destino
+    """
+    if not rules:
+        return json.dumps({"erro": "rules está vazio"}, ensure_ascii=False)
+
+    compiladas = []
+    for i, r in enumerate(rules):
+        if not r.get("sender_contains") or not r.get("target_folder"):
+            return json.dumps(
+                {"erro": f"rules[{i}] precisa de sender_contains e target_folder"},
+                ensure_ascii=False,
+            )
+        try:
+            folder_id = _resolve_folder_id(r["target_folder"])
+        except ValueError as e:
+            return json.dumps({"erro": f"rules[{i}] ('{r['target_folder']}'): {e}"}, ensure_ascii=False)
+        compiladas.append({
+            "regra": r,
+            "folder_id": folder_id,
+            "casa": _compilar_regra(r["sender_contains"], r.get("subject_contains"),
+                                    r.get("subject_not_contains")),
+            "ids": [],
+            "amostra": [],
+        })
+
+    nao_classificados_total = 0
+    nao_classificados_amostra = []
+    varridas = 0
+
+    for m in _iter_messages(folder=folder, unread_only=unread_only,
+                            campos=["id", "de", "assunto"], max_items=max_scan, skip=skip):
+        varridas += 1
+        end = ((m.get("from") or {}).get("emailAddress", {}).get("address") or "").lower()
+
+        for c in compiladas:
+            if c["casa"](m):
+                c["ids"].append(m["id"])
+                if len(c["amostra"]) < amostra_por_regra:
+                    c["amostra"].append({"de": end, "assunto": m.get("subject")})
+                break
+        else:
+            nao_classificados_total += 1
+            if len(nao_classificados_amostra) < max_nao_classificados:
+                nao_classificados_amostra.append({"de": end, "assunto": m.get("subject")})
+
+    atingiu_limite = varridas >= max_scan
+    regras_saida = []
+    for c in compiladas:
+        item = {
+            "sender_contains": c["regra"]["sender_contains"],
+            "subject_contains": c["regra"].get("subject_contains"),
+            "subject_not_contains": c["regra"].get("subject_not_contains"),
+            "target_folder": c["regra"]["target_folder"],
+            "encontrados": len(c["ids"]),
+            "amostra": c["amostra"],
+        }
+        if not dry_run and c["ids"]:
+            r = _move_ids_batch(c["ids"], c["folder_id"])
+            item["movidos"] = len(r["movidos"])
+            item["falharam"] = len(r["falhas"])
+            item["detalhes_falhas"] = r["falhas"]
+        regras_saida.append(item)
+
+    return json.dumps({
+        "dry_run": dry_run,
+        "mensagens_varridas": varridas,
+        "skip_usado": skip,
+        "atingiu_limite_varredura": atingiu_limite,
+        "proximo_skip": skip + varridas if atingiu_limite else None,
+        "regras": regras_saida,
+        "nao_classificados": {
+            "total": nao_classificados_total,
+            "amostra": nao_classificados_amostra,
+        },
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 def move_by_sender(
     sender_contains: str,
     target_folder: str,
@@ -605,7 +736,7 @@ def move_by_sender(
 
     Args:
         sender_contains: trecho do endereço do remetente (ex: '99freelas', '@newsletter.com')
-        target_folder: pasta destino (nome bem-conhecido, nome de exibição ou id)
+        target_folder: pasta destino — nome bem-conhecido, nome de exibição ou id
         folder: pasta de origem (padrão: inbox)
         dry_run: se True (padrão), só simula e devolve a contagem
         max_scan: teto de mensagens a percorrer nesta chamada (padrão: 400)
@@ -618,6 +749,14 @@ def move_by_sender(
     alvo = sender_contains.strip().lower()
     if not alvo:
         return json.dumps({"erro": "sender_contains está vazio"}, ensure_ascii=False)
+
+    # Valida o destino ANTES de varrer, mesmo em dry_run: um nome de pasta
+    # inválido deve aparecer de imediato, não só depois de percorrer max_scan
+    # mensagens e chegar em dry_run=False.
+    try:
+        _resolve_folder_id(target_folder)
+    except ValueError as e:
+        return json.dumps({"erro": str(e)}, ensure_ascii=False)
 
     casa = _compilar_regra(sender_contains, subject_contains, subject_not_contains)
 
