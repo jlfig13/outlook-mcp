@@ -1,0 +1,19 @@
+# Ambiente virtual
+.venv/
+venv/
+
+# Credenciais — NUNCA versionar
+token_cache.bin
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Editores / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

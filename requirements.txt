@@ -1,0 +1,8 @@
+# Núcleo (modo stdio, Claude Desktop local)
+mcp>=1.6.0,<2
+httpx>=0.27.0
+msal>=1.28.0
+
+# Necessário apenas para o modo HTTP (server_http.py)
+uvicorn>=0.30.0
+starlette>=0.37.0

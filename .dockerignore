@@ -1,0 +1,9 @@
+.venv/
+venv/
+token_cache.bin
+.env
+__pycache__/
+*.pyc
+.git/
+.gitignore
+README.md
