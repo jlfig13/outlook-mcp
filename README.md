@@ -13,7 +13,7 @@ MCP Outlook/
 ├── outlook_mcp/         # código do servidor
 │   ├── __init__.py
 │   ├── auth.py          # login MSAL (device code) + cache de token
-│   ├── server.py        # definição do MCP e das 14 ferramentas
+│   ├── server.py        # definição do MCP e das 15 ferramentas
 │   └── http_app.py      # app Starlette + middleware de auth Bearer
 ├── docker/
 │   └── Dockerfile
@@ -113,6 +113,7 @@ Reinicie o Claude Desktop. As ferramentas devem aparecer disponíveis na convers
 | `get_email_content` | Retorna o corpo completo de um e-mail |
 | `move_email` | Move um e-mail para outra pasta |
 | `move_emails_batch` | Move vários e-mails de uma vez (lotes de 20 via `POST /$batch`) |
+| `preview_plan` | Avalia várias regras de remetente/assunto numa só varredura |
 | `move_by_sender` | Move tudo de um remetente, com `dry_run` por padrão |
 | `mark_as_read_batch` | Marca vários como lido/não lido em lote |
 | `list_rules` | Lista as regras de caixa de entrada |
@@ -136,10 +137,14 @@ Para caixas com centenas de e-mails, a ordem que gasta menos contexto:
    quantos não lidos, até 3 assuntos de exemplo) em poucos KB. Uma listagem
    equivalente custaria ~7x mais. Um remetente pode misturar tipos de e-mail
    (fatura e cupom do mesmo endereço) — os 3 exemplos ajudam a notar isso.
-2. **`move_by_sender`** com `dry_run=True` (o padrão) — confira a contagem
+2. Para classificar vários remetentes de uma vez, **`preview_plan`** — avalia
+   uma lista de regras numa única varredura (cada mensagem cai na primeira
+   regra que casar) e devolve `nao_classificados` com o que sobrou sem
+   destino. Uma varredura por regra sairia bem mais caro para N regras.
+3. **`move_by_sender`** com `dry_run=True` (o padrão) — confira a contagem
    antes de executar. Os IDs são filtrados no servidor e nunca trafegam. Use
    `subject_contains`/`subject_not_contains` para separar remetentes mistos.
-3. Só então `list_recent_emails` com `fields=["id","de","assunto"]` e `skip`
+4. Só então `list_recent_emails` com `fields=["id","de","assunto"]` e `skip`
    para o que sobrou. Cortar o `bodyPreview` reduz a resposta em ~75%.
 
 Caixas grandes: `sender_stats` e `move_by_sender` varrem no máximo `max_scan`

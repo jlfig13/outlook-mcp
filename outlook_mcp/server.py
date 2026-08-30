@@ -10,6 +10,7 @@ Ferramentas expostas:
   - move_email
   - move_emails_batch
   - move_by_sender
+  - preview_plan
   - mark_as_read_batch
   - list_rules
   - create_rule
@@ -463,6 +464,117 @@ def sender_stats(folder: str = "inbox", max_scan: int = 400, skip: int = 0,
     }, ensure_ascii=False, indent=2)
 
 
+def _compilar_regra(sender_contains: str, subject_contains: Optional[list[str]],
+                    subject_not_contains: Optional[list[str]]):
+    """Devolve uma função (mensagem -> bool) para o critério de uma regra de plano."""
+    alvo = sender_contains.strip().lower()
+    inclui = [s.lower() for s in (subject_contains or [])]
+    exclui = [s.lower() for s in (subject_not_contains or [])]
+
+    def casa(m: dict) -> bool:
+        end = ((m.get("from") or {}).get("emailAddress", {}).get("address") or "").lower()
+        if alvo and alvo not in end:
+            return False
+        assunto_lower = (m.get("subject") or "").lower()
+        if inclui and not any(s in assunto_lower for s in inclui):
+            return False
+        if exclui and any(s in assunto_lower for s in exclui):
+            return False
+        return True
+
+    return casa
+
+
+@mcp.tool()
+def preview_plan(rules: list[dict], folder: str = "inbox", max_scan: int = 400,
+                 skip: int = 0, unread_only: bool = False, amostra_por_regra: int = 3,
+                 max_nao_classificados: int = 30) -> str:
+    """
+    Avalia várias regras de classificação numa única varredura, em vez de uma
+    varredura por regra. Pensado para o passo de planejamento antes de mover
+    de fato: classificar N remetentes com move_by_sender custa N varreduras
+    completas da mesma janela de mensagens; aqui custa uma.
+
+    Cada mensagem é testada contra as regras NA ORDEM DADA e cai na primeira
+    que casar (mesma semântica de stopProcessingRules do create_rule) — por
+    isso a soma dos 'encontrados' bate com 'mensagens_varridas' menos
+    'nao_classificados', sem precisar somar na mão para conferir sobreposição.
+    O que nenhuma regra pegar aparece em 'nao_classificados', com amostra —
+    é o que sobra sem destino nesta janela.
+
+    Não move nada — é sempre um dry_run. Para executar, aplique move_by_sender
+    (ou move_emails_batch) regra por regra, usando os mesmos filtros aqui
+    validados.
+
+    Args:
+        rules: lista de {sender_contains, target_folder, subject_contains?, subject_not_contains?}.
+               target_folder só rotula a saída aqui — nenhuma pasta precisa existir ainda.
+        folder: pasta a varrer (padrão: inbox)
+        max_scan: teto de mensagens a percorrer nesta chamada (padrão: 400)
+        skip: quantas mensagens já varridas em chamadas anteriores pular
+        unread_only: considerar apenas não lidos
+        amostra_por_regra: quantos exemplos mostrar por regra que casou
+        max_nao_classificados: quantos exemplos mostrar do que sobrou sem destino
+    """
+    if not rules:
+        return json.dumps({"erro": "rules está vazio"}, ensure_ascii=False)
+
+    compiladas = []
+    for i, r in enumerate(rules):
+        if not r.get("sender_contains") or not r.get("target_folder"):
+            return json.dumps(
+                {"erro": f"rules[{i}] precisa de sender_contains e target_folder"},
+                ensure_ascii=False,
+            )
+        compiladas.append({
+            "regra": r,
+            "casa": _compilar_regra(r["sender_contains"], r.get("subject_contains"),
+                                    r.get("subject_not_contains")),
+            "encontrados": 0,
+            "amostra": [],
+        })
+
+    nao_classificados_total = 0
+    nao_classificados_amostra = []
+    varridas = 0
+
+    for m in _iter_messages(folder=folder, unread_only=unread_only,
+                            campos=["id", "de", "assunto"], max_items=max_scan, skip=skip):
+        varridas += 1
+        end = ((m.get("from") or {}).get("emailAddress", {}).get("address") or "").lower()
+
+        for c in compiladas:
+            if c["casa"](m):
+                c["encontrados"] += 1
+                if len(c["amostra"]) < amostra_por_regra:
+                    c["amostra"].append({"de": end, "assunto": m.get("subject")})
+                break
+        else:
+            nao_classificados_total += 1
+            if len(nao_classificados_amostra) < max_nao_classificados:
+                nao_classificados_amostra.append({"de": end, "assunto": m.get("subject")})
+
+    atingiu_limite = varridas >= max_scan
+    return json.dumps({
+        "mensagens_varridas": varridas,
+        "skip_usado": skip,
+        "atingiu_limite_varredura": atingiu_limite,
+        "proximo_skip": skip + varridas if atingiu_limite else None,
+        "regras": [{
+            "sender_contains": c["regra"]["sender_contains"],
+            "subject_contains": c["regra"].get("subject_contains"),
+            "subject_not_contains": c["regra"].get("subject_not_contains"),
+            "target_folder": c["regra"]["target_folder"],
+            "encontrados": c["encontrados"],
+            "amostra": c["amostra"],
+        } for c in compiladas],
+        "nao_classificados": {
+            "total": nao_classificados_total,
+            "amostra": nao_classificados_amostra,
+        },
+    }, ensure_ascii=False, indent=2)
+
+
 @mcp.tool()
 def move_by_sender(
     sender_contains: str,
@@ -507,8 +619,7 @@ def move_by_sender(
     if not alvo:
         return json.dumps({"erro": "sender_contains está vazio"}, ensure_ascii=False)
 
-    inclui = [s.lower() for s in (subject_contains or [])]
-    exclui = [s.lower() for s in (subject_not_contains or [])]
+    casa = _compilar_regra(sender_contains, subject_contains, subject_not_contains)
 
     campos = ["id", "de", "assunto"]
     casaram, amostra = [], []
@@ -516,14 +627,9 @@ def move_by_sender(
     for m in _iter_messages(folder=folder, unread_only=unread_only, campos=campos,
                             max_items=max_scan, skip=skip):
         varridas += 1
+        if not casa(m):
+            continue
         end = ((m.get("from") or {}).get("emailAddress", {}).get("address") or "").lower()
-        if alvo not in end:
-            continue
-        assunto_lower = (m.get("subject") or "").lower()
-        if inclui and not any(s in assunto_lower for s in inclui):
-            continue
-        if exclui and any(s in assunto_lower for s in exclui):
-            continue
         casaram.append(m["id"])
         if len(amostra) < 5:
             amostra.append({"de": end, "assunto": m.get("subject")})
